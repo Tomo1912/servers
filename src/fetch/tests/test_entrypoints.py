@@ -31,7 +31,7 @@ def run_main(monkeypatch: pytest.MonkeyPatch, *argv: str) -> AsyncMock:
 
 def test_main_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     serve = run_main(monkeypatch)
-    serve.assert_awaited_once_with(None, False, None, False)
+    serve.assert_awaited_once_with(None, False, None, False, [])
 
 
 def test_main_passes_every_flag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -43,9 +43,18 @@ def test_main_passes_every_flag(monkeypatch: pytest.MonkeyPatch) -> None:
         "--proxy-url",
         "http://proxy.example.com:8080",
         "--allow-private-ips",
+        "--allow-private-host",
+        "intranet.example.com",
+        "--allow-private-host",
+        "LOCALHOST.",
     )
+    # Hosts are passed through as given; serve() normalizes them.
     serve.assert_awaited_once_with(
-        "MyBot/1.0", True, "http://proxy.example.com:8080", True
+        "MyBot/1.0",
+        True,
+        "http://proxy.example.com:8080",
+        True,
+        ["intranet.example.com", "LOCALHOST."],
     )
 
 
@@ -62,6 +71,7 @@ def test_main_help_exits_zero(
         "--ignore-robots-txt",
         "--proxy-url",
         "--allow-private-ips",
+        "--allow-private-host",
     ):
         assert flag in out
 
@@ -90,7 +100,7 @@ def test_package_init_run_as_main_calls_main(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(mcp_server_fetch.server, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["mcp-server-fetch"])
     runpy.run_module("mcp_server_fetch.__init__", run_name="__main__")
-    serve.assert_awaited_once_with(None, False, None, False)
+    serve.assert_awaited_once_with(None, False, None, False, [])
 
 
 def console_script() -> Path:

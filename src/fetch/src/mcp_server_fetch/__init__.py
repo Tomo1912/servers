@@ -22,6 +22,15 @@ def main():
         help="Allow fetching private, loopback and link-local addresses (refused by default)",
     )
 
+    parser.add_argument(
+        "--allow-private-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Allow fetching HOST even if it resolves to a private address "
+        "(repeatable); redirects from it to other private addresses are still refused",
+    )
+
     args = parser.parse_args()
     asyncio.run(
         serve(
@@ -29,6 +38,7 @@ def main():
             args.ignore_robots_txt,
             args.proxy_url,
             args.allow_private_ips,
+            args.allow_private_host,
         )
     )
 

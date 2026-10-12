@@ -11,7 +11,7 @@ Requires MCP Python SDK 2.x (`mcp>=2.2,<3`).
 > [!CAUTION]
 > This server can access local/internal IP addresses and may represent a security risk. Exercise caution when using this MCP server to ensure this does not expose any sensitive data.
 >
-> By default the server refuses to fetch private, loopback, link-local and other non-public addresses, including cloud metadata endpoints such as `169.254.169.254`, and checks every redirect hop the same way. The `--allow-private-ips` argument turns this guard off; see [Customization - Private addresses](#customization---private-addresses). The guard checks the addresses a hostname resolves to before each request, so it does not protect against DNS rebinding between that check and the connection, and a hostname the server cannot resolve itself (one only a proxy can resolve) is not checked.
+> By default the server refuses to fetch private, loopback, link-local and other non-public addresses, including cloud metadata endpoints such as `169.254.169.254`, and checks every redirect hop the same way. The `--allow-private-ips` argument turns this guard off, and `--allow-private-host` exempts single hosts; see [Customization - Private addresses](#customization---private-addresses). The guard checks the addresses a hostname resolves to before each request, and again when it opens a direct connection, which then goes only to the addresses it checked, so a DNS answer that changes between the two (DNS rebinding) is refused. A hostname the server cannot resolve itself (one only a proxy can resolve) is not checked, and a request sent through a proxy is checked only before it is sent: the proxy resolves the name and connects on its side.
 
 The fetch tool will truncate the response, but by using the `start_index` argument, you can specify where to start the content extraction. This lets models read a webpage in chunks, until they find the information they need.
 
@@ -171,8 +171,20 @@ address that is not globally routable: loopback (`127.0.0.0/8`, `::1`), private 
 multicast, unspecified, documentation and the other IANA special-purpose ranges. A hostname is refused if any one of its addresses is in those ranges.
 The client receives an error naming the refused address.
 
+The check is made twice for a direct connection: before each request, and when the connection is opened. The server
+resolves the hostname itself at connect time and connects only to the addresses it checked, trying them in order, so a
+DNS server that answers with a public address first and an internal one later (DNS rebinding) cannot steer the
+connection inward. TLS still uses the hostname, so certificate checks and SNI are unchanged. A request sent through a
+proxy is checked only before it is sent, since the proxy resolves the name and connects on its side.
+
 To fetch from local or internal hosts (a development server, an intranet page), add the argument
-`--allow-private-ips` to the `args` list in the configuration.
+`--allow-private-ips` to the `args` list in the configuration. That turns the guard off for every host.
+
+To allow only particular hosts, add `--allow-private-host HOST` instead, once for each host, for example
+`"--allow-private-host", "intranet.example.com"`. Such a host is fetched without checking what it resolves to. Hosts
+are compared without regard to case, a trailing dot or the brackets around an IPv6 address (`[::1]` and `::1` are the
+same host). Every other host is still checked, so a redirect from an allowed host to another private address is
+refused.
 
 ### Customization - User-agent
 

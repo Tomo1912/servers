@@ -800,6 +800,103 @@ async def test_allow_private_ips_follows_redirect_to_private_address(
     assert web.lookups == []
 
 
+async def test_allowed_private_host_is_fetched_without_a_lookup(
+    web: FakeWeb,
+) -> None:
+    web.dns["intranet.example.com"] = ["10.1.2.3"]
+    robots = "http://intranet.example.com/robots.txt"
+    url = "http://intranet.example.com/wiki"
+    web.add(robots, plain("", status=404))
+    web.add(url, plain("internal page"))
+    async with connect(allow_private_hosts=["intranet.example.com"]) as (session, _):
+        result = await call(session, {"url": url})
+        prompt = await session.get_prompt("fetch", {"url": url})
+    assert text_of(result) == f"{RAW_PREFIX_PLAIN}Contents of {url}:\ninternal page"
+    assert prompt.description == f"Contents of {url}"
+    # robots.txt, the tool fetch and the prompt fetch all skip the check.
+    assert web.urls() == [robots, url, url]
+    assert web.lookups == []
+    assert web.guarded == [frozenset({"intranet.example.com"})] * 3
+
+
+@pytest.mark.parametrize(
+    ("allowed", "url"),
+    [
+        ("INTRANET.Example.com", "http://intranet.example.com/"),
+        ("intranet.example.com.", "http://intranet.example.com/"),
+        ("intranet.example.com", "http://intranet.example.com./"),
+        ("[::1]", "http://[::1]/"),
+        ("::1", "http://[::1]/"),
+    ],
+)
+async def test_allowed_private_hosts_are_normalized(
+    web: FakeWeb, allowed: str, url: str
+) -> None:
+    web.dns["intranet.example.com"] = ["10.1.2.3"]
+    web.dns["intranet.example.com."] = ["10.1.2.3"]
+    web.add(url, plain("ok"))
+    async with connect(ignore_robots_txt=True, allow_private_hosts=[allowed]) as (
+        session,
+        _,
+    ):
+        result = await call(session, {"url": url})
+    assert wire(result)["isError"] is False
+    assert web.urls() == [url]
+    assert web.lookups == []
+
+
+async def test_redirect_from_allowed_host_to_private_address_is_refused(
+    web: FakeWeb,
+) -> None:
+    web.dns["intranet.example.com"] = ["10.1.2.3"]
+    url = "http://intranet.example.com/"
+    metadata = "http://169.254.169.254/latest/meta-data/"
+    web.add(url, httpx.Response(302, headers={"location": metadata}))
+    web.add(metadata, plain("instance-secret"))
+    async with connect(
+        ignore_robots_txt=True, allow_private_hosts=["intranet.example.com"]
+    ) as (session, _):
+        result = await call(session, {"url": url})
+    assert text_of(result) == refused(metadata, "169.254.169.254", "169.254.169.254")
+    assert web.urls() == [url]
+
+
+async def test_other_private_hosts_stay_refused_with_an_allowlist(
+    web: FakeWeb,
+) -> None:
+    web.dns["other.example.com"] = ["10.9.9.9"]
+    url = "http://other.example.com/"
+    async with connect(
+        ignore_robots_txt=True, allow_private_hosts=["intranet.example.com"]
+    ) as (session, _):
+        result = await call(session, {"url": url})
+    assert text_of(result) == refused(url, "other.example.com", "10.9.9.9")
+    assert web.requests == []
+
+
+async def test_rebinding_backend_is_installed_on_every_guarded_client(
+    web: FakeWeb,
+) -> None:
+    # Also with a proxy: the backend sits under the direct transport only, and
+    # a proxied request goes through the proxy's own transport.
+    web.add(ROBOTS, plain("", status=404))
+    web.add(PAGE, plain("ok"))
+    async with connect(proxy_url="http://proxy.example.com:8080") as (session, _):
+        await call(session, {"url": PAGE})
+        await session.get_prompt("fetch", {"url": PAGE})
+    assert web.guarded == [frozenset()] * 3
+
+
+async def test_allow_private_ips_installs_no_rebinding_backend(web: FakeWeb) -> None:
+    web.add(PAGE, plain("ok"))
+    async with connect(ignore_robots_txt=True, allow_private_ips=True) as (
+        session,
+        _,
+    ):
+        await call(session, {"url": PAGE})
+    assert web.guarded == []
+
+
 async def test_guard_uses_the_real_resolver() -> None:
     # No `web` fixture: the real getaddrinfo resolves localhost to loopback,
     # and the request is refused before any connection is attempted.

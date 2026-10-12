@@ -3,6 +3,10 @@
 # beside the handlers because every request path (tool, prompt and robots.txt
 # check) must go through it: the private-address guard on each request and
 # redirect hop, robots.txt for autonomous fetches, and proxy normalization.
+# The guard runs twice: a request hook resolves the host before each request,
+# and a network backend resolves it again at connect time and dials only the
+# addresses it checked, so a DNS answer that changes between the two (DNS
+# rebinding) cannot steer the connection to an internal address.
 #
 # Built on the MCP Python SDK v2's low-level `Server` (#4851). That SDK no
 # longer validates tool arguments or folds tool exceptions into `isError`
@@ -13,13 +17,16 @@
 # (roots, sampling, elicitation, logging), so nothing differs between them.
 
 import asyncio
+import contextvars
+import functools
 import ipaddress
 import os
 import socket
-from typing import Annotated, Any, Tuple
+from typing import Annotated, Any, Iterable, Sequence, Tuple
 from importlib.metadata import version
 from urllib.parse import urlparse, urlunparse
 
+import httpcore
 import httpx
 import jsonschema
 import markdownify
@@ -137,15 +144,43 @@ def _is_public_address(address: str) -> bool:
     return ip.is_global and not ip.is_multicast
 
 
-async def _refuse_private_destination(request: httpx.Request) -> None:
+def _normalize_host(host: str) -> str:
+    """The form hosts are compared in: lower case, no brackets, no trailing dot."""
+    return host.strip().lower().removeprefix("[").removesuffix("]").rstrip(".")
+
+
+# The URL being requested, set by the request hook so the network backend, which
+# only sees a host and port, can name it in the same refusal message.
+_requested_url: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_requested_url", default=None
+)
+
+
+def _private_destination_error(url: str, host: str, address: str) -> MCPError:
+    return MCPError(
+        code=INVALID_PARAMS,
+        message=f"Refused to fetch {url}: {host} resolves to {address}, "
+        "which is not a public address. Start the server with "
+        "--allow-private-ips to allow private, loopback and link-local addresses.",
+    )
+
+
+async def _refuse_private_destination(
+    request: httpx.Request, allowed_hosts: frozenset[str] = frozenset()
+) -> None:
     """httpx request hook: refuse a request whose host is not a public address.
 
     httpx runs request hooks before every request it sends, redirect hops
-    included, so a public URL cannot bounce the fetch to an internal one.
+    included, so a public URL cannot bounce the fetch to an internal one. A
+    host in ``allowed_hosts`` (``--allow-private-host``, normalized) is not
+    checked; a redirect from it to another host is.
     """
     host = request.url.host
     if not host:
         return  # httpx rejects a URL with no host itself.
+    _requested_url.set(str(request.url))
+    if _normalize_host(host) in allowed_hosts:
+        return
     try:
         addresses = await _resolve_host(host)
     except socket.gaierror:
@@ -154,12 +189,114 @@ async def _refuse_private_destination(request: httpx.Request) -> None:
         return
     for address in addresses:
         if not _is_public_address(address):
-            raise MCPError(
-                code=INVALID_PARAMS,
-                message=f"Refused to fetch {request.url}: {host} resolves to {address}, "
-                "which is not a public address. Start the server with "
-                "--allow-private-ips to allow private, loopback and link-local addresses.",
-            )
+            raise _private_destination_error(str(request.url), host, address)
+
+
+class _PublicAddressBackend(httpcore.AsyncNetworkBackend):
+    """A network backend that connects only to public addresses it resolved itself.
+
+    The request hook checks what a host resolves to, but httpcore resolves the
+    name again when it connects, and a rebinding DNS server can answer with a
+    public address the first time and an internal one the second. This backend
+    resolves the host once, refuses the connection if any address is not
+    public, and dials those checked addresses in order, so no second lookup
+    happens. Only the TCP connection uses the address: httpcore starts TLS
+    with the request's host name, so certificate checks and SNI are unchanged.
+    """
+
+    def __init__(
+        self, inner: httpcore.AsyncNetworkBackend, allowed_hosts: frozenset[str]
+    ) -> None:
+        self._inner = inner
+        self._allowed_hosts = allowed_hosts
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if _normalize_host(host) in self._allowed_hosts:
+            addresses = [host]
+        else:
+            try:
+                addresses = await _resolve_host(host)
+            except socket.gaierror as e:
+                raise httpcore.ConnectError(str(e)) from e
+            for address in addresses:
+                if not _is_public_address(address):
+                    raise _private_destination_error(
+                        _requested_url.get() or host, host, address
+                    )
+        error: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._inner.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as e:
+                error = e
+        assert error is not None  # getaddrinfo never returns an empty list.
+        raise error
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return await self._inner.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _install_public_address_backend(
+    client: httpx.AsyncClient, allowed_hosts: frozenset[str]
+) -> None:
+    """Put ``_PublicAddressBackend`` under the client's direct connections.
+
+    httpx has no public hook for this, so it reaches into private attributes:
+    ``client._transport`` is the direct transport (a proxy gets its own
+    transport in ``client._mounts``, which is left alone, since the proxy
+    resolves the name on its side), and its ``_pool._network_backend`` is what
+    opens TCP connections. If an httpx release changes that layout, the fetch
+    fails rather than silently losing the rebinding check.
+    """
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    backend = getattr(pool, "_network_backend", None)
+    if not (
+        isinstance(transport, httpx.AsyncHTTPTransport)
+        and isinstance(pool, httpcore.AsyncConnectionPool)
+        and isinstance(backend, httpcore.AsyncNetworkBackend)
+    ):
+        raise MCPError(
+            code=INTERNAL_ERROR,
+            message="Failed to set up the private-address guard: this httpx "
+            f"version ({httpx.__version__}) does not expose the connection pool "
+            "the guard needs. Start the server with --allow-private-ips to fetch "
+            "without the guard.",
+        )
+    pool._network_backend = _PublicAddressBackend(backend, allowed_hosts)
+
+
+def _guard_client(client: httpx.AsyncClient, allowed_hosts: frozenset[str]) -> None:
+    """Apply the private-address guard to ``client``: the hook and the backend."""
+    client.event_hooks = {
+        "request": [
+            functools.partial(_refuse_private_destination, allowed_hosts=allowed_hosts)
+        ]
+    }
+    _install_public_address_backend(client, allowed_hosts)
 
 
 def extract_content_from_html(html: str) -> str:
@@ -237,6 +374,10 @@ def normalize_proxy_env() -> None:
             os.environ[name] = normalize_proxy_url(value)
 
 
+def _normalize_hosts(hosts: Sequence[str]) -> frozenset[str]:
+    return frozenset(_normalize_host(host) for host in hosts)
+
+
 def make_client(proxy_url: str | None) -> httpx.AsyncClient:
     """Build the httpx client, turning a bad proxy setting into a tool error.
 
@@ -260,6 +401,7 @@ async def check_may_autonomously_fetch_url(
     user_agent: str,
     proxy_url: str | None = None,
     allow_private_ips: bool = False,
+    allow_private_hosts: Sequence[str] = (),
 ) -> None:
     """
     Check if the URL can be fetched by the user agent according to the robots.txt file.
@@ -271,7 +413,7 @@ async def check_may_autonomously_fetch_url(
 
     async with make_client(proxy_url) as client:
         if not allow_private_ips:
-            client.event_hooks = {"request": [_refuse_private_destination]}
+            _guard_client(client, _normalize_hosts(allow_private_hosts))
         try:
             response = await client.get(
                 robot_txt_url,
@@ -313,6 +455,7 @@ async def fetch_url(
     force_raw: bool = False,
     proxy_url: str | None = None,
     allow_private_ips: bool = False,
+    allow_private_hosts: Sequence[str] = (),
 ) -> Tuple[str, str]:
     """
     Fetch the URL and return the content in a form ready for the LLM, as well as a prefix string with status information.
@@ -321,7 +464,7 @@ async def fetch_url(
 
     async with make_client(proxy_url) as client:
         if not allow_private_ips:
-            client.event_hooks = {"request": [_refuse_private_destination]}
+            _guard_client(client, _normalize_hosts(allow_private_hosts))
         try:
             response = await client.get(
                 url,
@@ -398,6 +541,7 @@ async def serve(
     ignore_robots_txt: bool = False,
     proxy_url: str | None = None,
     allow_private_ips: bool = False,
+    allow_private_hosts: Sequence[str] = (),
 ) -> None:
     """Run the fetch MCP server.
 
@@ -407,6 +551,9 @@ async def serve(
         proxy_url: Optional proxy URL to use for requests
         allow_private_ips: Allow fetching private, loopback and link-local
             addresses, which are refused by default
+        allow_private_hosts: Hosts exempt from that refusal (compared without
+            case, brackets or a trailing dot); a redirect from one of them to
+            another private address is still refused
     """
     if proxy_url:
         proxy_url = normalize_proxy_url(proxy_url)
@@ -464,7 +611,11 @@ Although originally you did not have internet access, and were advised to refuse
 
         if not ignore_robots_txt:
             await check_may_autonomously_fetch_url(
-                url, user_agent_autonomous, proxy_url, allow_private_ips
+                url,
+                user_agent_autonomous,
+                proxy_url,
+                allow_private_ips,
+                allow_private_hosts,
             )
 
         content, prefix = await fetch_url(
@@ -473,6 +624,7 @@ Although originally you did not have internet access, and were advised to refuse
             force_raw=args.raw,
             proxy_url=proxy_url,
             allow_private_ips=allow_private_ips,
+            allow_private_hosts=allow_private_hosts,
         )
         original_length = len(content)
         if args.start_index >= original_length:
@@ -527,6 +679,7 @@ Although originally you did not have internet access, and were advised to refuse
                 user_agent_manual,
                 proxy_url=proxy_url,
                 allow_private_ips=allow_private_ips,
+                allow_private_hosts=allow_private_hosts,
             )
             # TODO: after SDK bug is addressed, don't catch the exception
         except MCPError as e:

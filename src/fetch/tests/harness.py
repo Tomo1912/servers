@@ -10,7 +10,10 @@ Two pieces:
   request and the keyword arguments each client was constructed with. It also
   replaces the server's DNS lookup (``_resolve_host``) with ``FakeWeb.dns``:
   a hostname listed there resolves to its addresses, an IP literal resolves to
-  itself, and any other name resolves to ``PUBLIC_IP``.
+  itself, and any other name resolves to ``PUBLIC_IP``. A MockTransport has
+  no connection pool to put the rebinding backend under, so the fixture
+  records each install (``FakeWeb.guarded``) instead; ``test_rebinding.py``
+  drives the real backend against a real socket.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ class FakeWeb:
     # hostname -> addresses; an empty list makes the name unresolvable.
     dns: dict[str, list[str]] = field(default_factory=dict)
     lookups: list[str] = field(default_factory=list)
+    # The allowed hosts of each client the rebinding backend was installed on.
+    guarded: list[frozenset[str]] = field(default_factory=list)
 
     def add(self, url: str, response: Responder) -> None:
         self.routes[url] = response
@@ -77,6 +82,11 @@ class FakeWeb:
             raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
         return addresses
 
+    def install_backend(
+        self, client: httpx.AsyncClient, allowed_hosts: frozenset[str]
+    ) -> None:
+        self.guarded.append(allowed_hosts)
+
 
 @pytest.fixture
 def web(monkeypatch: pytest.MonkeyPatch) -> FakeWeb:
@@ -95,6 +105,9 @@ def web(monkeypatch: pytest.MonkeyPatch) -> FakeWeb:
     # patching the attribute on the httpx module is what it picks up.
     monkeypatch.setattr(httpx, "AsyncClient", factory)
     monkeypatch.setattr(server_module, "_resolve_host", fake.resolve)
+    monkeypatch.setattr(
+        server_module, "_install_public_address_backend", fake.install_backend
+    )
     return fake
 
 
